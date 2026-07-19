@@ -1,0 +1,207 @@
+#!/usr/bin/env bash
+# Provision and deliberately mutate isolated GitHub CLI persona profiles.
+set -euo pipefail
+
+die() {
+  printf 'gh-persona-admin: %s\n' "$*" >&2
+  exit 1
+}
+
+usage() {
+  cat >&2 <<'EOF'
+usage:
+  gh-persona-admin migrate-default PROFILE USER
+  gh-persona-admin login PROFILE USER
+  gh-persona-admin refresh PROFILE USER
+  gh-persona-admin status PROFILE USER
+  gh-persona-admin lock PROFILE
+  gh-persona-admin unlock PROFILE
+  gh-persona-admin seal-default
+EOF
+  exit 2
+}
+
+validate_profile() {
+  case "$1" in
+  *[!A-Za-z0-9._-]* | '') die "invalid profile: $1" ;;
+  esac
+}
+
+validate_user() {
+  case "$1" in
+  *[!A-Za-z0-9-]* | '') die "invalid GitHub user: $1" ;;
+  esac
+}
+
+script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)
+
+find_real_gh() {
+  "$script_dir/libexec/persona-real-gh"
+}
+
+real_gh=$(find_real_gh)
+
+profile_root=${GH_PERSONA_PROFILE_ROOT:-"$HOME/.config/gh-profiles"}
+default_dir=${GH_PERSONA_DEFAULT_CONFIG_DIR:-"$HOME/.config/gh"}
+
+unlock_profile() {
+  local profile_dir=$1
+  [ -e "$profile_dir/config.yml" ] && chflags nouchg "$profile_dir/config.yml" 2>/dev/null || true
+  [ -e "$profile_dir/hosts.yml" ] && chflags nouchg "$profile_dir/hosts.yml" 2>/dev/null || true
+}
+
+lock_profile() {
+  local profile_dir=$1
+  [ -f "$profile_dir/config.yml" ] || die "missing config.yml in $profile_dir"
+  [ -f "$profile_dir/hosts.yml" ] || die "missing hosts.yml in $profile_dir"
+  chmod 600 "$profile_dir/config.yml" "$profile_dir/hosts.yml"
+  chflags uchg "$profile_dir/config.yml" "$profile_dir/hosts.yml" 2>/dev/null || true
+}
+
+relock_profile_best_effort() {
+  local profile_dir=$1
+  if [ -f "$profile_dir/config.yml" ]; then
+    chmod 600 "$profile_dir/config.yml" 2>/dev/null || true
+    chflags uchg "$profile_dir/config.yml" 2>/dev/null || true
+  fi
+  if [ -f "$profile_dir/hosts.yml" ]; then
+    chmod 600 "$profile_dir/hosts.yml" 2>/dev/null || true
+    chflags uchg "$profile_dir/hosts.yml" 2>/dev/null || true
+  fi
+}
+
+verify_profile() {
+  local profile_dir=$1 expected_user=$2 actual_user
+  actual_user=$(env \
+    -u GH_TOKEN \
+    -u GITHUB_TOKEN \
+    -u GH_ENTERPRISE_TOKEN \
+    -u GITHUB_ENTERPRISE_TOKEN \
+    -u GH_REPO \
+    -u GH_HOST \
+    GH_CONFIG_DIR="$profile_dir" \
+    GH_HOST=github.com \
+    GH_PROMPT_DISABLED=1 \
+    "$real_gh" api user --jq .login) ||
+    die "authentication failed for $profile_dir"
+  [ "$actual_user" = "$expected_user" ] ||
+    die "identity mismatch: expected $expected_user, authenticated as $actual_user"
+}
+
+command=${1:-}
+case "$command" in
+migrate-default)
+  [ "$#" -eq 3 ] || usage
+  profile=$2
+  expected_user=$3
+  validate_profile "$profile"
+  validate_user "$expected_user"
+  [ -d "$default_dir" ] || die "default config directory is unavailable: $default_dir"
+  profile_dir="$profile_root/$profile"
+  [ ! -e "$profile_dir" ] || die "profile already exists: $profile"
+  mkdir -p "$profile_root"
+  cp -pR "$default_dir" "$profile_dir"
+  verify_profile "$profile_dir" "$expected_user"
+  lock_profile "$profile_dir"
+  GH_PERSONA_REAL_GH="$real_gh" "$script_dir/persona-profile" sync "$profile"
+  printf 'migrated and locked profile %s for %s\n' "$profile" "$expected_user"
+  ;;
+login)
+  [ "$#" -eq 3 ] || usage
+  profile=$2
+  expected_user=$3
+  validate_profile "$profile"
+  validate_user "$expected_user"
+  profile_dir="$profile_root/$profile"
+  mkdir -p "$profile_dir"
+  chmod 700 "$profile_dir"
+  unlock_profile "$profile_dir"
+  # shellcheck disable=SC2154 # profile_dir is assigned before this trap is installed.
+  trap 'rc=$?; relock_profile_best_effort "$profile_dir"; exit "$rc"' EXIT
+  env \
+    -u GH_TOKEN \
+    -u GITHUB_TOKEN \
+    -u GH_ENTERPRISE_TOKEN \
+    -u GITHUB_ENTERPRISE_TOKEN \
+    -u GH_REPO \
+    -u GH_HOST \
+    GH_CONFIG_DIR="$profile_dir" \
+    GH_HOST=github.com \
+    "$real_gh" auth login \
+    --hostname github.com \
+    --git-protocol ssh \
+    --skip-ssh-key \
+    --web
+  verify_profile "$profile_dir" "$expected_user"
+  lock_profile "$profile_dir"
+  GH_PERSONA_REAL_GH="$real_gh" "$script_dir/persona-profile" sync "$profile"
+  trap - EXIT
+  printf 'authenticated and locked profile %s for %s\n' "$profile" "$expected_user"
+  ;;
+refresh)
+  [ "$#" -eq 3 ] || usage
+  profile=$2
+  expected_user=$3
+  validate_profile "$profile"
+  validate_user "$expected_user"
+  profile_dir="$profile_root/$profile"
+  [ -d "$profile_dir" ] || die "profile is not initialized: $profile"
+  unlock_profile "$profile_dir"
+  # shellcheck disable=SC2154 # profile_dir is assigned before this trap is installed.
+  trap 'rc=$?; relock_profile_best_effort "$profile_dir"; exit "$rc"' EXIT
+  env \
+    -u GH_TOKEN \
+    -u GITHUB_TOKEN \
+    -u GH_ENTERPRISE_TOKEN \
+    -u GITHUB_ENTERPRISE_TOKEN \
+    -u GH_REPO \
+    -u GH_HOST \
+    GH_CONFIG_DIR="$profile_dir" \
+    GH_HOST=github.com \
+    "$real_gh" auth refresh --hostname github.com
+  verify_profile "$profile_dir" "$expected_user"
+  lock_profile "$profile_dir"
+  GH_PERSONA_REAL_GH="$real_gh" "$script_dir/persona-profile" verify "$profile"
+  trap - EXIT
+  printf 'refreshed and locked profile %s for %s\n' "$profile" "$expected_user"
+  ;;
+status)
+  [ "$#" -eq 3 ] || usage
+  profile=$2
+  expected_user=$3
+  validate_profile "$profile"
+  validate_user "$expected_user"
+  profile_dir="$profile_root/$profile"
+  [ -d "$profile_dir" ] || die "profile is not initialized: $profile"
+  verify_profile "$profile_dir" "$expected_user"
+  printf 'profile %s is authenticated as %s\n' "$profile" "$expected_user"
+  ;;
+lock)
+  [ "$#" -eq 2 ] || usage
+  profile=$2
+  validate_profile "$profile"
+  lock_profile "$profile_root/$profile"
+  [ ! -f "$profile_root/$profile/gitconfig" ] ||
+    "$script_dir/persona-profile" lock "$profile"
+  ;;
+unlock)
+  [ "$#" -eq 2 ] || usage
+  profile=$2
+  validate_profile "$profile"
+  unlock_profile "$profile_root/$profile"
+  [ ! -f "$profile_root/$profile/gitconfig" ] ||
+    "$script_dir/persona-profile" unlock "$profile"
+  ;;
+seal-default)
+  [ "$#" -eq 1 ] || usage
+  [ -d "$default_dir" ] || die "default config is already sealed or unavailable: $default_dir"
+  backup_dir="$profile_root/default-backup-$(date -u +%Y%m%dT%H%M%SZ)"
+  mkdir -p "$profile_root"
+  mv "$default_dir" "$backup_dir"
+  printf '%s\n' 'GitHub CLI default configuration is intentionally disabled.' >"$default_dir"
+  chmod 400 "$default_dir"
+  chflags uchg "$default_dir" 2>/dev/null || true
+  printf 'sealed default config; recoverable backup: %s\n' "$backup_dir"
+  ;;
+*) usage ;;
+esac

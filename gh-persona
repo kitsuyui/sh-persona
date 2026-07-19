@@ -1,0 +1,274 @@
+#!/usr/bin/env bash
+# Run GitHub CLI with the identity selected by repository-local git config.
+set -euo pipefail
+
+die() {
+  printf 'gh-persona: %s\n' "$*" >&2
+  exit 1
+}
+
+find_real_gh() {
+  local script_dir
+  script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)
+  "$script_dir/libexec/persona-real-gh"
+}
+
+reject_unsafe_command() {
+  local arg
+  case "${1:-} ${2:-}" in
+  'auth login' | 'auth logout' | 'auth refresh' | 'auth setup-git' | 'auth switch')
+    die 'authentication mutation is disabled; use gh-persona-admin'
+    ;;
+  'auth token')
+    die 'token output is disabled through the guarded command'
+    ;;
+  'config set' | 'alias delete' | 'alias import' | 'alias set')
+    die 'configuration mutation is disabled through the guarded command'
+    ;;
+  'extension install' | 'extension remove' | 'extension upgrade')
+    die 'extension mutation is disabled through the guarded command'
+    ;;
+  esac
+  for arg in "$@"; do
+    case "$arg" in
+    --show-token | --show-token=*) die 'token output is disabled through the guarded command' ;;
+    esac
+  done
+}
+
+reject_repository_override() {
+  local arg previous=''
+  for arg in "$@"; do
+    case "$previous" in
+    -R | --repo)
+      die 'explicit repository selection is disabled in private-only mode'
+      ;;
+    esac
+    case "$arg" in
+    -R?* | --repo=* | --host | --host=* | --hostname | --hostname=* | https://github.com/* | http://github.com/*)
+      die 'explicit repository selection is disabled in private-only mode'
+      ;;
+    esac
+    previous="$arg"
+  done
+}
+
+require_private_only_command() {
+  case "${1:-} ${2:-}" in
+  'issue transfer' | 'label clone')
+    die "command is not allowed in private-only mode: $1 $2"
+    ;;
+  'pr '* | 'issue '* | 'release '* | 'run '* | 'workflow '* | 'cache '* | 'label '* | 'browse '*) ;;
+  'repo view')
+    [ "$#" -eq 2 ] || die 'repo view arguments are disabled in private-only mode'
+    ;;
+  *)
+    die "command is not allowed in private-only mode: ${1:-<none>}"
+    ;;
+  esac
+}
+
+load_hub_scope() {
+  local path slug owner
+
+  hub_root=$(git rev-parse --show-toplevel 2>/dev/null) || return 1
+  [ -f "$hub_root/.gitmodules" ] || return 1
+
+  hub_repositories=()
+  hub_owners=()
+  while IFS= read -r path; do
+    case "$path" in
+    repo/github.com/*/*)
+      slug=${path#repo/github.com/}
+      case "$slug" in
+      */*/* | */ | /*) continue ;;
+      esac
+      owner=${slug%%/*}
+      hub_repositories+=("$slug")
+      hub_owners+=("$owner")
+      ;;
+    esac
+  done < <(
+    git config -f "$hub_root/.gitmodules" --get-regexp '^submodule\..*\.path$' 2>/dev/null |
+      awk '{print $2}'
+  )
+
+  [ "${#hub_repositories[@]}" -gt 0 ]
+}
+
+hub_has_owner() {
+  local expected=$1 owner
+  for owner in "${hub_owners[@]}"; do
+    [ "$owner" = "$expected" ] && return 0
+  done
+  return 1
+}
+
+hub_has_repository() {
+  local expected=$1 repository
+  for repository in "${hub_repositories[@]}"; do
+    [ "$repository" = "$expected" ] && return 0
+  done
+  return 1
+}
+
+hub_allows_search() {
+  local arg value scoped=false
+  shift 2
+
+  while [ "$#" -gt 0 ]; do
+    arg=$1
+    case "$arg" in
+    --owner)
+      [ "$#" -ge 2 ] || return 1
+      value=$2
+      hub_has_owner "$value" || return 1
+      scoped=true
+      shift 2
+      ;;
+    --owner=*)
+      value=${arg#--owner=}
+      hub_has_owner "$value" || return 1
+      scoped=true
+      shift
+      ;;
+    --repo)
+      [ "$#" -ge 2 ] || return 1
+      value=$2
+      hub_has_repository "$value" || return 1
+      scoped=true
+      shift 2
+      ;;
+    --repo=*)
+      value=${arg#--repo=}
+      hub_has_repository "$value" || return 1
+      scoped=true
+      shift
+      ;;
+    --limit | --json | --state | --jq | --template)
+      [ "$#" -ge 2 ] || return 1
+      shift 2
+      ;;
+    --limit=* | --json=* | --state=* | --jq=* | --template=* | --merged)
+      shift
+      ;;
+    *) return 1 ;;
+    esac
+  done
+
+  [ "$scoped" = true ]
+}
+
+hub_allows_repository_argument() {
+  local option=$1 arg previous='' repository=''
+  shift
+
+  for arg in "$@"; do
+    case "$previous" in
+    "$option") repository=$arg ;;
+    esac
+    case "$arg" in
+    "$option"=*) repository=${arg#*=} ;;
+    esac
+    previous=$arg
+  done
+
+  [ -n "$repository" ] && hub_has_repository "$repository"
+}
+
+hub_allows_read_only_command() {
+  load_hub_scope || return 1
+
+  case "${1:-} ${2:-}" in
+  'auth status') [ "$#" -eq 2 ] ;;
+  'search prs' | 'search issues') hub_allows_search "$@" ;;
+  'pr list') hub_allows_repository_argument --repo "$@" ;;
+  'repo list')
+    [ "$#" -ge 3 ] && hub_has_owner "$3"
+    ;;
+  'repo view')
+    [ "$#" -ge 3 ] && hub_has_repository "$3"
+    ;;
+  *) return 1 ;;
+  esac
+}
+
+persona_status=false
+if [ "$#" -eq 1 ] && [ "$1" = persona-status ]; then
+  persona_status=true
+fi
+
+profile=$(git config --local --get persona.profile 2>/dev/null ||
+  git config --local --get gh.profile 2>/dev/null) ||
+  die 'persona.profile is not configured for this repository'
+expected_user=$(git config --local --get persona.githubUser 2>/dev/null ||
+  git config --local --get gh.user 2>/dev/null) ||
+  die 'persona.githubUser is not configured for this repository'
+private_only=$(git config --local --get --bool persona.privateOnly 2>/dev/null ||
+  git config --local --get --bool gh.private-only 2>/dev/null || printf 'true')
+
+case "$profile" in
+*[!A-Za-z0-9._-]* | '') die "invalid persona.profile: $profile" ;;
+esac
+case "$expected_user" in
+*[!A-Za-z0-9-]* | '') die "invalid persona.githubUser: $expected_user" ;;
+esac
+
+profile_root=${GH_PERSONA_PROFILE_ROOT:-"$HOME/.config/gh-profiles"}
+profile_dir="$profile_root/$profile"
+[ -d "$profile_dir" ] || die "profile is not initialized: $profile"
+[ -r "$profile_dir/hosts.yml" ] || die "profile has no readable hosts.yml: $profile"
+
+real_gh=$(find_real_gh)
+
+gh_env=(
+  env
+  -u GH_TOKEN
+  -u GITHUB_TOKEN
+  -u GH_ENTERPRISE_TOKEN
+  -u GITHUB_ENTERPRISE_TOKEN
+  -u GH_REPO
+  -u GH_HOST
+  GH_CONFIG_DIR="$profile_dir"
+  GH_HOST=github.com
+  GH_PROMPT_DISABLED=1
+  GH_NO_UPDATE_NOTIFIER=1
+  GH_NO_EXTENSION_UPDATE_NOTIFIER=1
+)
+
+actual_user=$("${gh_env[@]}" "$real_gh" api user --jq .login) ||
+  die "authentication failed for profile: $profile"
+[ "$actual_user" = "$expected_user" ] ||
+  die "identity mismatch: expected $expected_user, authenticated as $actual_user"
+
+if [ "$persona_status" = true ]; then
+  printf 'persona=%s\n' "$profile"
+  printf 'github_user=%s\n' "$actual_user"
+  printf 'verified=true\n'
+  exit 0
+fi
+
+reject_unsafe_command "$@"
+
+if [ "$private_only" = 'true' ]; then
+  hub_read_only=false
+  if hub_allows_read_only_command "$@"; then
+    hub_read_only=true
+  fi
+
+  if [ "$hub_read_only" = false ]; then
+    reject_repository_override "$@"
+    require_private_only_command "$@"
+  fi
+
+  repo_json=$("${gh_env[@]}" "$real_gh" repo view --json nameWithOwner,isPrivate) ||
+    die 'the current repository is not accessible with the selected profile'
+  repo_name=$(jq -r '.nameWithOwner' <<<"$repo_json")
+  repo_private=$(jq -r '.isPrivate' <<<"$repo_json")
+  [ "$repo_private" = 'true' ] || die "public repository access is disabled: $repo_name"
+  if [ "$hub_read_only" = false ]; then
+    gh_env+=(GH_REPO="$repo_name")
+  fi
+fi
+
+exec "${gh_env[@]}" "$real_gh" "$@"

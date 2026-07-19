@@ -1,0 +1,252 @@
+#!/usr/bin/env bash
+# Apply and verify repository-local Git, SSH, and signing persona settings.
+set -euo pipefail
+
+usage() {
+  cat >&2 <<'EOF'
+Usage:
+  git-persona apply PERSONA
+  git-persona verify [PERSONA]
+  git-persona status
+  git-persona list
+
+This primitive reads non-secret settings from
+~/.config/gh-profiles/PERSONA/{gitconfig,ssh_config}. It does not access the
+network or mutate GitHub CLI authentication state.
+EOF
+  exit 2
+}
+
+die() {
+  printf 'git-persona: %s\n' "$*" >&2
+  exit 1
+}
+
+require_repository() {
+  git rev-parse --git-dir >/dev/null 2>&1 || die 'not inside a Git repository'
+}
+
+validate_persona() {
+  case "$1" in
+  *[!A-Za-z0-9._-]* | '') die "invalid persona: $1" ;;
+  esac
+}
+
+config_get() {
+  git config --file "$PROFILE_DIR/gitconfig" --get "$1" 2>/dev/null
+}
+
+config_get_or() {
+  local value
+  value=$(config_get "$1" || true)
+  printf '%s\n' "${value:-$2}"
+}
+
+config_get_bool_or() {
+  local value
+  value=$(git config --file "$PROFILE_DIR/gitconfig" --bool --get "$1" 2>/dev/null || true)
+  printf '%s\n' "${value:-$2}"
+}
+
+load_persona() {
+  local profile_root ssh_config_quoted
+  PERSONA=$1
+  validate_persona "$PERSONA"
+  profile_root=${GH_PERSONA_PROFILE_ROOT:-"$HOME/.config/gh-profiles"}
+  PROFILE_DIR="$profile_root/$PERSONA"
+  [ -d "$PROFILE_DIR" ] || die "unknown persona: $PERSONA"
+  [ -r "$PROFILE_DIR/gitconfig" ] || die "persona has no readable gitconfig: $PERSONA"
+  [ -r "$PROFILE_DIR/ssh_config" ] || die "persona has no readable ssh_config: $PERSONA"
+
+  GH_USER=$(config_get github.user) || die "persona has no github.user: $PERSONA"
+  USERNAME=$(config_get_or user.name "$GH_USER")
+  EMAIL=$(config_get user.email) || die "persona has no user.email: $PERSONA"
+  SIGNING=$(config_get_bool_or persona.signing true)
+  GPG_KEY=$(config_get_or user.signingkey "$GH_USER")
+  GPG_FORMAT=$(config_get_or gpg.format openpgp)
+  case "$GPG_FORMAT" in
+  openpgp)
+    GPG_PROGRAM_KEY=gpg.program
+    GPG_PROGRAM=$(config_get_or "$GPG_PROGRAM_KEY" gpg)
+    ;;
+  ssh)
+    GPG_PROGRAM_KEY=gpg.ssh.program
+    GPG_PROGRAM=$(config_get_or "$GPG_PROGRAM_KEY" ssh-keygen)
+    ;;
+  x509)
+    GPG_PROGRAM_KEY=gpg.x509.program
+    GPG_PROGRAM=$(config_get_or "$GPG_PROGRAM_KEY" gpgsm)
+    ;;
+  *) die "unsupported gpg.format: $GPG_FORMAT" ;;
+  esac
+  SSH_ALIAS=$(config_get_or persona.sshAlias "$GH_USER.github.com.invalid")
+  PRIVATE_ONLY=$(config_get_bool_or persona.privateOnly true)
+  printf -v ssh_config_quoted '%q' "$PROFILE_DIR/ssh_config"
+  SSH_COMMAND="ssh -F $ssh_config_quoted"
+  SSH_URL="ssh://${SSH_ALIAS}/"
+}
+
+managed_ssh_aliases() {
+  local recorded_alias
+  recorded_alias=$(git config --local --get persona.sshAlias 2>/dev/null || true)
+  [ -z "$recorded_alias" ] || printf '%s\n' "$recorded_alias"
+  git config --local --name-only --get-regexp \
+    '^url\.ssh://[^/]+\.github\.com(\.invalid)?/\.insteadOf$' \
+    '^git@github\.com:$' 2>/dev/null |
+    sed -e 's/^url\.//' -e 's/\.insteadOf$//'
+}
+
+set_local() {
+  git config --local --replace-all "$1" "$2"
+}
+
+unset_local() {
+  git config --local --unset-all "$1" 2>/dev/null || true
+}
+
+apply_persona() {
+  local alias
+  require_repository
+  load_persona "$1"
+
+  while IFS= read -r alias; do
+    [ -n "$alias" ] || continue
+    unset_local "url.${alias}.insteadOf"
+  done < <(managed_ssh_aliases | LC_ALL=C sort -u)
+
+  set_local user.name "$USERNAME"
+  set_local user.email "$EMAIL"
+  unset_local gpg.program
+  unset_local gpg.ssh.program
+  unset_local gpg.x509.program
+  if [ "$SIGNING" = true ]; then
+    set_local user.signingkey "$GPG_KEY"
+    set_local gpg.format "$GPG_FORMAT"
+    set_local "$GPG_PROGRAM_KEY" "$GPG_PROGRAM"
+  else
+    unset_local user.signingkey
+    unset_local gpg.format
+  fi
+  set_local core.sshCommand "$SSH_COMMAND"
+  set_local "url.${SSH_URL}.insteadOf" 'git@github.com:'
+
+  set_local persona.profile "$PERSONA"
+  set_local persona.githubUser "$GH_USER"
+  set_local persona.privateOnly "$PRIVATE_ONLY"
+  set_local persona.sshAlias "$SSH_URL"
+
+  # Compatibility for existing gh-persona installations.
+  set_local gh.profile "$PERSONA"
+  set_local gh.user "$GH_USER"
+  set_local gh.private-only "$PRIVATE_ONLY"
+
+  verify_persona "$PERSONA"
+}
+
+verify_value() {
+  local key=$1 expected=$2 actual
+  actual=$(git config --local --get-all "$key" 2>/dev/null) ||
+    die "missing local config: $key"
+  [ "$actual" = "$expected" ] || die "local config mismatch: $key"
+}
+
+verify_absent() {
+  local value
+  value=$(git config --local --get-all "$1" 2>/dev/null || true)
+  [ -z "$value" ] || die "unexpected local config: $1"
+}
+
+verify_persona() {
+  local alias value program_key
+  require_repository
+  load_persona "$1"
+
+  verify_value user.name "$USERNAME"
+  verify_value user.email "$EMAIL"
+  if [ "$SIGNING" = true ]; then
+    verify_value user.signingkey "$GPG_KEY"
+    verify_value gpg.format "$GPG_FORMAT"
+    verify_value "$GPG_PROGRAM_KEY" "$GPG_PROGRAM"
+    for program_key in gpg.program gpg.ssh.program gpg.x509.program; do
+      [ "$program_key" = "$GPG_PROGRAM_KEY" ] || verify_absent "$program_key"
+    done
+  else
+    verify_absent user.signingkey
+    verify_absent gpg.format
+    for program_key in gpg.program gpg.ssh.program gpg.x509.program; do
+      verify_absent "$program_key"
+    done
+  fi
+  verify_value core.sshCommand "$SSH_COMMAND"
+  verify_value "url.${SSH_URL}.insteadOf" 'git@github.com:'
+  verify_value persona.profile "$PERSONA"
+  verify_value persona.githubUser "$GH_USER"
+  verify_value persona.privateOnly "$PRIVATE_ONLY"
+  verify_value persona.sshAlias "$SSH_URL"
+
+  while IFS= read -r alias; do
+    [ "$alias" = "$SSH_URL" ] && continue
+    value=$(git config --local --get-all "url.${alias}.insteadOf" 2>/dev/null || true)
+    [ -z "$value" ] || die "conflicting persona SSH alias remains: $alias"
+  done < <(managed_ssh_aliases | LC_ALL=C sort -u)
+}
+
+current_persona() {
+  git config --local --get persona.profile 2>/dev/null ||
+    git config --local --get gh.profile 2>/dev/null ||
+    die 'persona.profile is not configured'
+}
+
+show_status() {
+  local persona
+  require_repository
+  persona=$(current_persona)
+  load_persona "$persona"
+  printf 'persona=%s\n' "$PERSONA"
+  printf 'git_user=%s <%s>\n' \
+    "$(git config --local --get user.name 2>/dev/null || true)" \
+    "$(git config --local --get user.email 2>/dev/null || true)"
+  printf 'github_user=%s\n' "$(git config --local --get persona.githubUser 2>/dev/null || true)"
+  if verify_persona "$persona" >/dev/null 2>&1; then
+    printf 'verified=true\n'
+  else
+    printf 'verified=false\n'
+    return 1
+  fi
+}
+
+command=${1:-}
+case "$command" in
+apply)
+  [ "$#" -eq 2 ] || usage
+  apply_persona "$2"
+  ;;
+verify)
+  [ "$#" -le 2 ] || usage
+  require_repository
+  persona=${2:-$(current_persona)}
+  verify_persona "$persona"
+  ;;
+status)
+  [ "$#" -eq 1 ] || usage
+  show_status
+  ;;
+list)
+  [ "$#" -eq 1 ] || usage
+  profile_root=${GH_PERSONA_PROFILE_ROOT:-"$HOME/.config/gh-profiles"}
+  [ -d "$profile_root" ] || exit 0
+  for profile_dir in "$profile_root"/*; do
+    [ -d "$profile_dir" ] || continue
+    [ -r "$profile_dir/gitconfig" ] || continue
+    [ -r "$profile_dir/ssh_config" ] || continue
+    printf '%s\n' "${profile_dir##*/}"
+  done | LC_ALL=C sort
+  ;;
+*[!A-Za-z0-9._-]* | '')
+  usage
+  ;;
+*)
+  [ "$#" -eq 1 ] || usage
+  apply_persona "$command"
+  ;;
+esac

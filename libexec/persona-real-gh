@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# Locate the real GitHub CLI while skipping this package's guarded gh shim.
+set -euo pipefail
+
+die() {
+  printf 'persona-real-gh: %s\n' "$*" >&2
+  exit 1
+}
+
+if [ -n "${GH_PERSONA_REAL_GH:-}" ]; then
+  [ -x "$GH_PERSONA_REAL_GH" ] || die 'GH_PERSONA_REAL_GH is not executable'
+  printf '%s\n' "$GH_PERSONA_REAL_GH"
+  exit 0
+fi
+
+package_dir=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd -P)
+guard_path="$package_dir/gh-guard-bin/gh"
+
+while IFS= read -r path_entry; do
+  [ -n "$path_entry" ] || path_entry='.'
+  candidate="$path_entry/gh"
+  [ -x "$candidate" ] || continue
+  candidate_dir=$(CDPATH='' cd -- "$(dirname -- "$candidate")" 2>/dev/null && pwd -P) || continue
+  candidate="$candidate_dir/$(basename -- "$candidate")"
+  [ "$candidate" = "$guard_path" ] && continue
+  printf '%s\n' "$candidate"
+  exit 0
+done < <(printf '%s' "$PATH" | tr ':' '\n')
+
+die 'real gh executable was not found'

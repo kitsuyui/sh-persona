@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+# Convenient facade over the independent Git, GitHub, and profile primitives.
+set -euo pipefail
+
+usage() {
+  cat >&2 <<'EOF'
+Usage:
+  persona apply PERSONA
+  persona verify [PERSONA]
+  persona status
+  persona list
+  persona git COMMAND...
+  persona gh COMMAND...
+  persona profile COMMAND...
+EOF
+  exit 2
+}
+
+script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)
+command=${1:-}
+
+case "$command" in
+apply | list)
+  exec "$script_dir/git-persona" "$@"
+  ;;
+verify)
+  "$script_dir/git-persona" "$@"
+  "$script_dir/gh-persona" persona-status >/dev/null
+  ;;
+status)
+  printf '[git]\n'
+  "$script_dir/git-persona" status
+  printf '[github]\n'
+  "$script_dir/gh-persona" persona-status
+  ;;
+git)
+  shift
+  [ "$#" -gt 0 ] || usage
+  exec "$script_dir/git-persona" "$@"
+  ;;
+gh | github)
+  shift
+  [ "$#" -gt 0 ] || usage
+  exec "$script_dir/gh-persona" "$@"
+  ;;
+profile)
+  shift
+  [ "$#" -gt 0 ] || usage
+  exec "$script_dir/persona-profile" "$@"
+  ;;
+*) usage ;;
+esac

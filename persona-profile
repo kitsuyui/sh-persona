@@ -1,0 +1,196 @@
+#!/usr/bin/env bash
+# Provision and inspect the non-secret configuration shared by persona commands.
+# shellcheck disable=SC2088 # ssh expands literal ~/.ssh IdentityFile values.
+set -euo pipefail
+
+usage() {
+  cat >&2 <<'EOF'
+Usage:
+  persona-profile sync PERSONA
+  persona-profile render-ssh PERSONA
+  persona-profile verify PERSONA
+  persona-profile lock PERSONA
+  persona-profile unlock PERSONA
+  persona-profile list
+
+The GitHub CLI owns config.yml and hosts.yml. This command owns the initial
+gitconfig and ssh_config defaults, but never overwrites an existing gitconfig.
+EOF
+  exit 2
+}
+
+die() {
+  printf 'persona-profile: %s\n' "$*" >&2
+  exit 1
+}
+
+validate_persona() {
+  case "$1" in
+  *[!A-Za-z0-9._-]* | '') die "invalid persona: $1" ;;
+  esac
+}
+
+profile_root=${GH_PERSONA_PROFILE_ROOT:-"$HOME/.config/gh-profiles"}
+
+profile_dir_for() {
+  validate_persona "$1"
+  printf '%s/%s\n' "$profile_root" "$1"
+}
+
+find_real_gh() {
+  local script_dir
+  script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)
+  "$script_dir/libexec/persona-real-gh"
+}
+
+config_get() {
+  git config --file "$1/gitconfig" --get "$2" 2>/dev/null
+}
+
+config_get_or() {
+  local value
+  value=$(config_get "$1" "$2" || true)
+  printf '%s\n' "${value:-$3}"
+}
+
+unlock_file() {
+  [ -e "$1" ] || return 0
+  chflags nouchg "$1" 2>/dev/null || true
+}
+
+lock_file() {
+  chmod 600 "$1"
+  chflags uchg "$1" 2>/dev/null || true
+}
+
+write_default_gitconfig() {
+  local profile_dir=$1 login=$2 user_id=$3 email=$4 tmp_file
+  [ ! -e "$profile_dir/gitconfig" ] || return 0
+  [ -n "$email" ] || email="${user_id}+${login}@users.noreply.github.com"
+  tmp_file="$profile_dir/.gitconfig.tmp.$$"
+  trap 'rm -f "$tmp_file"' RETURN
+  : >"$tmp_file"
+  git config --file "$tmp_file" github.user "$login"
+  git config --file "$tmp_file" user.name "$login"
+  git config --file "$tmp_file" user.email "$email"
+  git config --file "$tmp_file" user.signingkey "$login"
+  git config --file "$tmp_file" gpg.format openpgp
+  git config --file "$tmp_file" gpg.program gpg
+  git config --file "$tmp_file" persona.signing false
+  git config --file "$tmp_file" persona.sshIdentityFile "~/.ssh/$login"
+  git config --file "$tmp_file" persona.sshAlias "$login.github.com.invalid"
+  git config --file "$tmp_file" persona.sshHost github.com
+  git config --file "$tmp_file" persona.privateOnly true
+  mv "$tmp_file" "$profile_dir/gitconfig"
+  trap - RETURN
+  lock_file "$profile_dir/gitconfig"
+}
+
+render_ssh() {
+  local profile_dir=$1 identity_file alias host tmp_file
+  [ -r "$profile_dir/gitconfig" ] || die "profile has no readable gitconfig: ${profile_dir##*/}"
+  identity_file=$(config_get_or "$profile_dir" persona.sshIdentityFile \
+    "~/.ssh/$(config_get "$profile_dir" github.user)")
+  alias=$(config_get_or "$profile_dir" persona.sshAlias \
+    "$(config_get "$profile_dir" github.user).github.com.invalid")
+  host=$(config_get_or "$profile_dir" persona.sshHost github.com)
+  case "$identity_file" in *$'\n'* | *$'\r'*) die 'SSH identity file must be single-line' ;; esac
+  case "$alias$host" in *$'\n'* | *$'\r'*) die 'SSH host values must be single-line' ;; esac
+  tmp_file="$profile_dir/.ssh_config.tmp.$$"
+  trap 'rm -f "$tmp_file"' RETURN
+  {
+    printf 'Host %s\n' "$alias"
+    printf '  HostName %s\n' "$host"
+    printf '  User git\n'
+    printf '  IdentityFile %s\n' "$identity_file"
+    printf '  IdentitiesOnly yes\n'
+  } >"$tmp_file"
+  unlock_file "$profile_dir/ssh_config"
+  mv "$tmp_file" "$profile_dir/ssh_config"
+  trap - RETURN
+  lock_file "$profile_dir/ssh_config"
+}
+
+authenticated_identity() {
+  local profile_dir=$1 real_gh
+  real_gh=$(find_real_gh)
+  env \
+    -u GH_TOKEN \
+    -u GITHUB_TOKEN \
+    -u GH_ENTERPRISE_TOKEN \
+    -u GITHUB_ENTERPRISE_TOKEN \
+    -u GH_REPO \
+    GH_CONFIG_DIR="$profile_dir" \
+    GH_HOST=github.com \
+    GH_PROMPT_DISABLED=1 \
+    "$real_gh" api /user --jq '[.login, (.id | tostring), (.email // "")] | @tsv'
+}
+
+verify_profile() {
+  local profile=$1 profile_dir identity login cached_login
+  profile_dir=$(profile_dir_for "$profile")
+  [ -r "$profile_dir/hosts.yml" ] || die "profile has no readable hosts.yml: $profile"
+  [ -r "$profile_dir/gitconfig" ] || die "profile has no readable gitconfig: $profile"
+  [ -r "$profile_dir/ssh_config" ] || die "profile has no readable ssh_config: $profile"
+  identity=$(authenticated_identity "$profile_dir") || die "authentication failed for persona: $profile"
+  IFS=$'\t' read -r login _ <<<"$identity"
+  cached_login=$(config_get "$profile_dir" github.user) || die "profile has no github.user: $profile"
+  [ "$login" = "$cached_login" ] ||
+    die "identity mismatch: configured $cached_login, authenticated as $login"
+}
+
+sync_profile() {
+  local profile=$1 profile_dir identity login user_id email
+  profile_dir=$(profile_dir_for "$profile")
+  [ -d "$profile_dir" ] || die "unknown persona: $profile"
+  [ -r "$profile_dir/hosts.yml" ] || die "profile has no readable hosts.yml: $profile"
+  identity=$(authenticated_identity "$profile_dir") || die "authentication failed for persona: $profile"
+  IFS=$'\t' read -r login user_id email <<<"$identity"
+  write_default_gitconfig "$profile_dir" "$login" "$user_id" "$email"
+  [ "$(config_get "$profile_dir" github.user)" = "$login" ] ||
+    die "existing gitconfig belongs to a different GitHub user: $profile"
+  [ -e "$profile_dir/ssh_config" ] || render_ssh "$profile_dir"
+  verify_profile "$profile"
+}
+
+command=${1:-}
+case "$command" in
+sync)
+  [ "$#" -eq 2 ] || usage
+  sync_profile "$2"
+  ;;
+render-ssh)
+  [ "$#" -eq 2 ] || usage
+  profile_dir=$(profile_dir_for "$2")
+  render_ssh "$profile_dir"
+  ;;
+verify)
+  [ "$#" -eq 2 ] || usage
+  verify_profile "$2"
+  ;;
+lock)
+  [ "$#" -eq 2 ] || usage
+  profile_dir=$(profile_dir_for "$2")
+  [ -f "$profile_dir/gitconfig" ] || die "profile has no gitconfig: $2"
+  [ -f "$profile_dir/ssh_config" ] || die "profile has no ssh_config: $2"
+  lock_file "$profile_dir/gitconfig"
+  lock_file "$profile_dir/ssh_config"
+  ;;
+unlock)
+  [ "$#" -eq 2 ] || usage
+  profile_dir=$(profile_dir_for "$2")
+  unlock_file "$profile_dir/gitconfig"
+  unlock_file "$profile_dir/ssh_config"
+  ;;
+list)
+  [ "$#" -eq 1 ] || usage
+  [ -d "$profile_root" ] || exit 0
+  for profile_dir in "$profile_root"/*; do
+    [ -d "$profile_dir" ] || continue
+    [ -r "$profile_dir/hosts.yml" ] || continue
+    [ -r "$profile_dir/gitconfig" ] || continue
+    printf '%s\n' "${profile_dir##*/}"
+  done | LC_ALL=C sort
+  ;;
+*) usage ;;
+esac
