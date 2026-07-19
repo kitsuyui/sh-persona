@@ -7,6 +7,7 @@ cd "$PROJECT_ROOT"
 
 tests/shellcheck.sh
 tests/shfmt.sh
+tests/persona-real-gh.sh
 tests/git-persona.sh
 tests/gh-persona.sh
 tests/gh-persona-admin.sh
