@@ -46,8 +46,12 @@ default_dir=${GH_PERSONA_DEFAULT_CONFIG_DIR:-"$HOME/.config/gh"}
 
 unlock_profile() {
   local profile_dir=$1
-  [ -e "$profile_dir/config.yml" ] && chflags nouchg "$profile_dir/config.yml" 2>/dev/null || true
-  [ -e "$profile_dir/hosts.yml" ] && chflags nouchg "$profile_dir/hosts.yml" 2>/dev/null || true
+  if [ -e "$profile_dir/config.yml" ]; then
+    chflags nouchg "$profile_dir/config.yml" 2>/dev/null || true
+  fi
+  if [ -e "$profile_dir/hosts.yml" ]; then
+    chflags nouchg "$profile_dir/hosts.yml" 2>/dev/null || true
+  fi
 }
 
 lock_profile() {

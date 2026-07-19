@@ -23,6 +23,7 @@ while IFS= read -r path_entry; do
   candidate_dir=$(CDPATH='' cd -- "$(dirname -- "$candidate")" 2>/dev/null && pwd -P) || continue
   candidate="$candidate_dir/$(basename -- "$candidate")"
   [ "$candidate" = "$guard_path" ] && continue
+  [ "$(basename -- "$candidate_dir")" = gh-guard-bin ] && continue
   printf '%s\n' "$candidate"
   exit 0
 done < <(printf '%s' "$PATH" | tr ':' '\n')
