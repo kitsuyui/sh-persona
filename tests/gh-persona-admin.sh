@@ -34,9 +34,16 @@ run_admin() {
     "$PROJECT_ROOT/gh-persona-admin" "$@"
 }
 
+file_mode() {
+  case "$(uname -s)" in
+  Darwin) stat -f '%Lp' "$1" ;;
+  *) stat -c '%a' "$1" ;;
+  esac
+}
+
 run_admin status work example-user
 run_admin lock work
-[ "$(stat -f '%Lp' "$profile_dir/config.yml" 2>/dev/null || stat -c '%a' "$profile_dir/config.yml")" = 600 ]
+[ "$(file_mode "$profile_dir/config.yml")" = 600 ]
 run_admin unlock work
 
 output=$(run_admin seal-default)
