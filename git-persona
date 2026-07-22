@@ -80,7 +80,6 @@ load_persona() {
   *) die "unsupported gpg.format: $GPG_FORMAT" ;;
   esac
   SSH_ALIAS=$(config_get_or persona.sshAlias "$GH_USER.github.com.invalid")
-  PRIVATE_ONLY=$(config_get_bool_or persona.privateOnly true)
   printf -v ssh_config_quoted '%q' "$PROFILE_DIR/ssh_config"
   SSH_COMMAND="ssh -F $ssh_config_quoted"
   SSH_URL="ssh://${SSH_ALIAS}/"
@@ -132,13 +131,13 @@ apply_persona() {
 
   set_local persona.profile "$PERSONA"
   set_local persona.githubUser "$GH_USER"
-  set_local persona.privateOnly "$PRIVATE_ONLY"
   set_local persona.sshAlias "$SSH_URL"
+  unset_local persona.privateOnly
 
   # Compatibility for existing gh-persona installations.
   set_local gh.profile "$PERSONA"
   set_local gh.user "$GH_USER"
-  set_local gh.private-only "$PRIVATE_ONLY"
+  unset_local gh.private-only
 
   verify_persona "$PERSONA"
 }
@@ -181,8 +180,9 @@ verify_persona() {
   verify_value "url.${SSH_URL}.insteadOf" 'git@github.com:'
   verify_value persona.profile "$PERSONA"
   verify_value persona.githubUser "$GH_USER"
-  verify_value persona.privateOnly "$PRIVATE_ONLY"
   verify_value persona.sshAlias "$SSH_URL"
+  verify_absent persona.privateOnly
+  verify_absent gh.private-only
 
   while IFS= read -r alias; do
     [ "$alias" = "$SSH_URL" ] && continue

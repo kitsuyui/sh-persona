@@ -80,7 +80,6 @@ write_default_gitconfig() {
   git config --file "$tmp_file" persona.sshIdentityFile "~/.ssh/$login"
   git config --file "$tmp_file" persona.sshAlias "$login.github.com.invalid"
   git config --file "$tmp_file" persona.sshHost github.com
-  git config --file "$tmp_file" persona.privateOnly true
   mv "$tmp_file" "$profile_dir/gitconfig"
   trap - RETURN
   lock_file "$profile_dir/gitconfig"
