@@ -36,174 +36,15 @@ reject_unsafe_command() {
   done
 }
 
-reject_repository_override() {
-  local arg previous=''
+reject_host_override() {
+  local arg
   for arg in "$@"; do
-    case "$previous" in
-    -R | --repo)
-      die 'explicit repository selection is disabled in guarded mode'
-      ;;
-    esac
     case "$arg" in
-    -R?* | --repo=* | --host | --host=* | --hostname | --hostname=* | https://github.com/* | http://github.com/*)
-      die 'explicit repository selection is disabled in guarded mode'
+    --host | --host=* | --hostname | --hostname=*)
+      die 'explicit host selection is disabled; the persona is bound to github.com'
       ;;
     esac
-    previous="$arg"
   done
-}
-
-viewer_manages_owner() {
-  local owner=$1 owner_normalized expected_user_normalized query
-  owner_normalized=$(printf '%s' "$owner" | tr '[:upper:]' '[:lower:]')
-  expected_user_normalized=$(printf '%s' "$expected_user" | tr '[:upper:]' '[:lower:]')
-  [ "$owner_normalized" = "$expected_user_normalized" ] && return 0
-
-  # shellcheck disable=SC2016 # GraphQL variable syntax is intentionally literal.
-  query='query($login:String!){organization(login:$login){viewerCanAdminister}}'
-  [ "$("${gh_env[@]}" "$real_gh" api graphql \
-    -f "query=$query" -F "login=$owner" \
-    --jq '.data.organization.viewerCanAdminister // false')" = true ]
-}
-
-require_guarded_command() {
-  case "${1:-} ${2:-}" in
-  'issue transfer' | 'label clone')
-    die "command is not allowed in guarded mode: $1 $2"
-    ;;
-  'pr '* | 'issue '* | 'release '* | 'run '* | 'workflow '* | 'cache '* | 'label '* | 'browse '*) ;;
-  'repo view')
-    [ "$#" -eq 2 ] || die 'repo view arguments are disabled in guarded mode'
-    ;;
-  *)
-    die "command is not allowed in guarded mode: ${1:-<none>}"
-    ;;
-  esac
-}
-
-load_hub_scope() {
-  local path slug owner
-
-  hub_root=$(git rev-parse --show-toplevel 2>/dev/null) || return 1
-  [ -f "$hub_root/.gitmodules" ] || return 1
-
-  hub_repositories=()
-  hub_owners=()
-  while IFS= read -r path; do
-    case "$path" in
-    repo/github.com/*/*)
-      slug=${path#repo/github.com/}
-      case "$slug" in
-      */*/* | */ | /*) continue ;;
-      esac
-      owner=${slug%%/*}
-      hub_repositories+=("$slug")
-      hub_owners+=("$owner")
-      ;;
-    esac
-  done < <(
-    git config -f "$hub_root/.gitmodules" --get-regexp '^submodule\..*\.path$' 2>/dev/null |
-      awk '{print $2}'
-  )
-
-  [ "${#hub_repositories[@]}" -gt 0 ]
-}
-
-hub_has_owner() {
-  local expected=$1 owner
-  for owner in "${hub_owners[@]}"; do
-    [ "$owner" = "$expected" ] && return 0
-  done
-  return 1
-}
-
-hub_has_repository() {
-  local expected=$1 repository
-  for repository in "${hub_repositories[@]}"; do
-    [ "$repository" = "$expected" ] && return 0
-  done
-  return 1
-}
-
-hub_allows_search() {
-  local arg value scoped=false
-  shift 2
-
-  while [ "$#" -gt 0 ]; do
-    arg=$1
-    case "$arg" in
-    --owner)
-      [ "$#" -ge 2 ] || return 1
-      value=$2
-      hub_has_owner "$value" || return 1
-      scoped=true
-      shift 2
-      ;;
-    --owner=*)
-      value=${arg#--owner=}
-      hub_has_owner "$value" || return 1
-      scoped=true
-      shift
-      ;;
-    --repo)
-      [ "$#" -ge 2 ] || return 1
-      value=$2
-      hub_has_repository "$value" || return 1
-      scoped=true
-      shift 2
-      ;;
-    --repo=*)
-      value=${arg#--repo=}
-      hub_has_repository "$value" || return 1
-      scoped=true
-      shift
-      ;;
-    --limit | --json | --state | --jq | --template)
-      [ "$#" -ge 2 ] || return 1
-      shift 2
-      ;;
-    --limit=* | --json=* | --state=* | --jq=* | --template=* | --merged)
-      shift
-      ;;
-    *) return 1 ;;
-    esac
-  done
-
-  [ "$scoped" = true ]
-}
-
-hub_allows_repository_argument() {
-  local option=$1 arg previous='' repository=''
-  shift
-
-  for arg in "$@"; do
-    case "$previous" in
-    "$option") repository=$arg ;;
-    esac
-    case "$arg" in
-    "$option"=*) repository=${arg#*=} ;;
-    esac
-    previous=$arg
-  done
-
-  [ -n "$repository" ] && hub_has_repository "$repository"
-}
-
-hub_allows_read_only_command() {
-  load_hub_scope || return 1
-
-  case "${1:-} ${2:-}" in
-  'auth status') [ "$#" -eq 2 ] ;;
-  'search prs' | 'search issues') hub_allows_search "$@" ;;
-  'pr list') hub_allows_repository_argument --repo "$@" ;;
-  'repo list')
-    [ "$#" -ge 3 ] && hub_has_owner "$3"
-    ;;
-  'repo view')
-    [ "$#" -ge 3 ] && hub_has_repository "$3"
-    ;;
-  *) return 1 ;;
-  esac
 }
 
 persona_status=false
@@ -217,9 +58,6 @@ profile=$(git config --local --get persona.profile 2>/dev/null ||
 expected_user=$(git config --local --get persona.githubUser 2>/dev/null ||
   git config --local --get gh.user 2>/dev/null) ||
   die 'persona.githubUser is not configured for this repository'
-private_only=$(git config --local --get --bool persona.privateOnly 2>/dev/null ||
-  git config --local --get --bool gh.private-only 2>/dev/null || printf 'true')
-
 case "$profile" in
 *[!A-Za-z0-9._-]* | '') die "invalid persona.profile: $profile" ;;
 esac
@@ -231,7 +69,6 @@ profile_root=${GH_PERSONA_PROFILE_ROOT:-"$HOME/.config/gh-profiles"}
 profile_dir="$profile_root/$profile"
 [ -d "$profile_dir" ] || die "profile is not initialized: $profile"
 [ -r "$profile_dir/hosts.yml" ] || die "profile has no readable hosts.yml: $profile"
-[ -r "$profile_dir/gitconfig" ] || die "profile has no readable gitconfig: $profile"
 
 real_gh=$(find_real_gh)
 
@@ -263,35 +100,6 @@ if [ "$persona_status" = true ]; then
 fi
 
 reject_unsafe_command "$@"
-
-if [ "$private_only" = 'true' ]; then
-  hub_read_only=false
-  if hub_allows_read_only_command "$@"; then
-    hub_read_only=true
-  fi
-
-  if [ "$hub_read_only" = false ]; then
-    reject_repository_override "$@"
-    require_guarded_command "$@"
-  fi
-
-  repo_json=$("${gh_env[@]}" "$real_gh" repo view \
-    --json nameWithOwner,isPrivate,owner,viewerPermission) ||
-    die 'the current repository is not accessible with the selected profile'
-  repo_name=$(jq -r '.nameWithOwner' <<<"$repo_json")
-  repo_private=$(jq -r '.isPrivate' <<<"$repo_json")
-  repo_owner=$(jq -r '.owner.login' <<<"$repo_json")
-  viewer_permission=$(jq -r '.viewerPermission' <<<"$repo_json")
-
-  if [ "$repo_private" != 'true' ]; then
-    viewer_manages_owner "$repo_owner" ||
-      die "public repository owner is not managed by this persona: $repo_owner"
-    [ "$viewer_permission" = ADMIN ] ||
-      die "insufficient repository permission: $viewer_permission"
-  fi
-  if [ "$hub_read_only" = false ]; then
-    gh_env+=(GH_REPO="$repo_name")
-  fi
-fi
+reject_host_override "$@"
 
 exec "${gh_env[@]}" "$real_gh" "$@"

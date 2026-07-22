@@ -40,6 +40,10 @@ run_profile sync work
 [ "$(git config --file "$profile_dir/gitconfig" --get user.email)" = \
   123+example-user@users.noreply.github.com ]
 [ "$(git config --file "$profile_dir/gitconfig" --bool --get persona.signing)" = false ]
+if git config --file "$profile_dir/gitconfig" --get persona.privateOnly >/dev/null; then
+  echo 'expected repository authorization policy to be absent from the persona' >&2
+  exit 1
+fi
 grep -Fq 'Host example-user.github.com.invalid' "$profile_dir/ssh_config"
 grep -Fq 'HostName github.com' "$profile_dir/ssh_config"
 run_profile verify work

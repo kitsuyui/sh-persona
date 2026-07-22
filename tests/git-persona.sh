@@ -44,6 +44,14 @@ assert_config() {
   }
 }
 
+assert_config_absent() {
+  local repo=$1 key=$2
+  if git -C "$repo" config --local --get-all "$key" >/dev/null; then
+    printf 'expected %s to be absent\n' "$key" >&2
+    exit 1
+  fi
+}
+
 personas=(work team test)
 users=(example-user example-bot example-test)
 profiles=(work team test)
@@ -72,6 +80,8 @@ for index in "${!personas[@]}"; do
   assert_config "$repo" gh.user "${users[$index]}"
   assert_config "$repo" persona.profile "${profiles[$index]}"
   assert_config "$repo" persona.githubUser "${users[$index]}"
+  assert_config_absent "$repo" persona.privateOnly
+  assert_config_absent "$repo" gh.private-only
   assert_config "$repo" "url.${aliases[$index]}.insteadOf" 'git@github.com:'
   status=$(cd "$repo" && "$PROJECT_ROOT/git-persona" status)
   grep -Fq "persona=$persona" <<<"$status"
