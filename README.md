@@ -23,7 +23,7 @@ selection to be explicit, repository-local, and fail-closed.
 - Git
 - OpenSSH
 - [GitHub CLI](https://cli.github.com/)
-- `jq` when private-only GitHub command guarding is enabled
+- `jq` when GitHub repository guarding is enabled
 
 Immutable-file hardening uses `chflags` when it is available. The remaining
 profile isolation and verification features are portable across Unix-like
@@ -80,7 +80,7 @@ The generated defaults use:
 - `~/.ssh/<login>` as the SSH identity file;
 - `<login>.github.com.invalid` as a profile-local SSH alias;
 - signing disabled until explicitly configured;
-- private-only GitHub operations enabled.
+- guarded GitHub operations enabled.
 
 Unlock `gitconfig` to override those defaults, then regenerate and relock the
 SSH configuration:
@@ -93,9 +93,12 @@ persona profile render-ssh work
 persona profile lock work
 ```
 
-For public-repository work, prefer a separate profile whose `gitconfig` sets
-`persona.privateOnly` to `false`. This keeps the safer private-only behavior as
-the default for other profiles.
+Guarded profiles can maintain public repositories owned by the authenticated
+user or by an organization that user can administer. GitHub's owner and
+permission data is checked for each repository, so organizations do not need a
+separate persona. Public repositories owned by anyone else remain inaccessible
+through guarded write commands, even when the authenticated user is only a
+member or collaborator.
 
 ## Repository selection
 
@@ -115,7 +118,7 @@ profile aligns all of the following values:
 - optional signing configuration;
 - `core.sshCommand`;
 - the `git@github.com:` URL rewrite;
-- expected GitHub login and private-only policy.
+- expected GitHub login and guarded repository policy.
 
 The direct primitives remain independently usable:
 
@@ -134,11 +137,17 @@ Because `git-persona` follows Git's external-subcommand convention,
 `GH_CONFIG_DIR` to the selected profile, verifies the authenticated GitHub
 login, and then evaluates the requested command.
 
-With `persona.privateOnly=true`, it also verifies that the current repository
-is private. Authentication mutation, token output, configuration mutation,
-extension installation, arbitrary repository overrides, and commands outside
-the guarded allowlist are rejected. A submodule hub receives narrowly scoped,
-read-only listing support for repositories declared in its `.gitmodules`.
+With `persona.privateOnly=true`, it also confines commands to the current
+repository and an audited command allowlist. The legacy setting name is kept
+for compatibility; it now enables the repository guard rather than rejecting
+every public repository. Private repositories continue to work as before.
+Public repositories are accepted only when their owner is the authenticated
+user or an organization that user can administer, and the viewer has `ADMIN`
+permission on the repository. Authentication mutation, token output,
+configuration mutation, extension installation, arbitrary repository
+overrides, foreign public repositories, and commands outside the guarded
+allowlist are rejected. A submodule hub receives narrowly scoped, read-only
+listing support for repositories declared in its `.gitmodules`.
 
 Credential mutation is deliberately separated into `gh-persona-admin`. The
 default `~/.config/gh` directory can be replaced by an immutable sentinel:
